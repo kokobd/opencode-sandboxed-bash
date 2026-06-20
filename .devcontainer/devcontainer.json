@@ -1,0 +1,11 @@
+{
+  "name": "opencode-sandboxed-bash",
+  "build": {
+    "dockerfile": "../Dockerfile"
+  },
+  "runArgs": [
+    "--security-opt", "seccomp=unconfined",
+    "--security-opt", "apparmor=unconfined"
+  ],
+  "postCreateCommand": "npm install"
+}
