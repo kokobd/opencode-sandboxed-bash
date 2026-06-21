@@ -1,11 +1,11 @@
 {
   "name": "@kokobd/opencode-sandboxed-bash",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Sandboxed bash plugin for opencode",
   "license": "MIT",
   "type": "module",
   "exports": {
-    ".": "./sandboxed-bash.ts"
+    "./server": "./sandboxed-bash.ts"
   },
   "files": [
     "sandboxed-bash.ts"
