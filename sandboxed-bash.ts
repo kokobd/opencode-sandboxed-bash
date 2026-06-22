@@ -17,11 +17,46 @@ const captureNotice = (stdoutTruncated: boolean, stderrTruncated: boolean): stri
   return undefined
 }
 
+// How many of the most recent messages we scan for a prior sandboxed-bash attempt.
+const SANDBOX_LOOKBACK_MESSAGES = 10
+
 const plugin: Plugin = async (input, options) => {
   const bwrapPath = (options?.bwrapPath as string) ?? "bwrap"
   const extraWritableDirs = (options?.extraWritableDirs as string[]) ?? []
 
   return {
+    // Gate the builtin bash tool: before it runs (and before the user is asked to
+    // approve it), require that the exact same command was attempted in the sandbox
+    // within the recent chat history. This nudges the model to prefer sandboxed-bash
+    // and only fall back to the approval-gated builtin bash when the sandbox can't
+    // run the command (e.g. it needs network access).
+    "tool.execute.before": async (hookInput, hookOutput) => {
+      if (hookInput.tool !== "bash") return
+
+      const command = hookOutput.args?.command
+      if (typeof command !== "string") return
+      const target = command.trim()
+
+      const response = await input.client.session.messages({
+        path: {id: hookInput.sessionID},
+      })
+      const messages = response.data ?? []
+      const recent = messages.slice(-SANDBOX_LOOKBACK_MESSAGES)
+
+      const triedInSandbox = recent.some(message =>
+        message.parts.some(part => {
+          if (part.type !== "tool" || part.tool !== "sandboxed-bash") return false
+          const tried = part.state.input?.command
+          return typeof tried === "string" && tried.trim() === target
+        }),
+      )
+
+      if (!triedInSandbox) {
+        throw new Error(
+          "Run this exact command with the sandboxed-bash tool first. The builtin bash tool requires user approval, so it may only be used after the sandbox has been tried and shown unable to run the command (e.g. it needs network access).",
+        )
+      }
+    },
     tool: {
       "sandboxed-bash": tool({
         description: `Execute shell commands inside an isolated sandbox. Prefer this over the builtin bash tool whenever the command does not need network access, since it runs without user approval.
