@@ -63,8 +63,8 @@ const plugin: Plugin = async (input, options) => {
 
 Sandbox constraints:
 - No Internet/network access (Unix domain sockets on the filesystem, e.g. gpg-agent, are still accessible).
-- Filesystem is read-only except for the project directory, any configured extra directories, and /tmp.
-- Writes to the project directory and /tmp are persistent (they map to the real host directories) and survive across invocations.
+- Filesystem is read-only except for the project directory${extraWritableDirs.length > 0 ? ` and these extra writable directories: ${extraWritableDirs.join(", ")}` : ""}.
+- Writes to the writable directories are persistent (they map to the real host directories) and survive across invocations.
 - Operations that the sandbox blocks (network access, writes to read-only paths) fail with a non-zero exit status and an error message on stderr, both reflected in the tool output.
 
 Use the builtin bash tool instead when the command needs to download files, reach a remote API, or write a file that must persist outside the project directory.`,
@@ -72,7 +72,7 @@ Use the builtin bash tool instead when the command needs to download files, reac
           command: tool.schema.string(),
         },
         async execute(args: SandboxedBashArgs, context: ToolContext): Promise<ToolResult> {
-          const writableDirs: string[] = ["/tmp", context.directory, ...extraWritableDirs.filter(existsSync)]
+          const writableDirs: string[] = [context.directory, ...extraWritableDirs.filter(existsSync)]
           const bindArgs: string[] = writableDirs.flatMap(dir => ["--bind", dir, dir])
 
           const bwrapArgs: string[] = [
