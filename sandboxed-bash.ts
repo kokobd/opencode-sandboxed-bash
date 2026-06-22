@@ -17,7 +17,11 @@ const captureNotice = (stdoutTruncated: boolean, stderrTruncated: boolean): stri
   return undefined
 }
 
-// How many of the most recent messages we scan for a prior sandboxed-bash attempt.
+// How many of the most recent messages we scan for a prior attempt of the same
+// command (in either sandboxed-bash or builtin bash). A window rather than just
+// the last message is deliberate: the model may try the command in the sandbox,
+// do a few unrelated explorations, then fall back to builtin bash — and that
+// fallback should pass without re-triggering the speed-bump.
 const SANDBOX_LOOKBACK_MESSAGES = 10
 
 const plugin: Plugin = async (input, options) => {
@@ -25,11 +29,14 @@ const plugin: Plugin = async (input, options) => {
   const extraWritableDirs = (options?.extraWritableDirs as string[]) ?? []
 
   return {
-    // Gate the builtin bash tool: before it runs (and before the user is asked to
-    // approve it), require that the exact same command was attempted in the sandbox
-    // within the recent chat history. This nudges the model to prefer sandboxed-bash
-    // and only fall back to the approval-gated builtin bash when the sandbox can't
-    // run the command (e.g. it needs network access).
+    // Speed-bump the builtin bash tool: before it runs (and before the user is
+    // asked to approve it), allow the command only if the exact same command was
+    // already attempted in the recent chat history — in either sandboxed-bash or
+    // builtin bash. The first attempt of any new command is auto-rejected to make
+    // the model pause and reconsider whether the sandbox would do; a verbatim
+    // retry then passes (the rejected attempt is now "already tried in bash").
+    // This nudges toward sandboxed-bash without hard-blocking legitimate fallback
+    // to the approval-gated builtin bash (e.g. when the command needs network).
     "tool.execute.before": async (hookInput, hookOutput) => {
       if (hookInput.tool !== "bash") return
 
@@ -43,23 +50,29 @@ const plugin: Plugin = async (input, options) => {
       const messages = response.data ?? []
       const recent = messages.slice(-SANDBOX_LOOKBACK_MESSAGES)
 
-      const triedInSandbox = recent.some(message =>
+      const triedBefore = recent.some(message =>
         message.parts.some(part => {
-          if (part.type !== "tool" || part.tool !== "sandboxed-bash") return false
+          if (part.type !== "tool") return false
+          if (part.tool !== "sandboxed-bash" && part.tool !== "bash") return false
+          // Exclude the in-flight call itself: its part already exists in the
+          // session (created when the model emitted the tool call, before this
+          // hook runs), so without this guard the command would always
+          // self-match and the gate would never fire.
+          if (part.callID === hookInput.callID) return false
           const tried = part.state.input?.command
           return typeof tried === "string" && tried.trim() === target
         }),
       )
 
-      if (!triedInSandbox) {
+      if (!triedBefore) {
         throw new Error(
-          "The builtin bash tool is approval-gated and may only run a command that was first attempted verbatim with the sandboxed-bash tool and shown unable to run there (e.g. it needs network access). The command strings must match exactly, whitespace included. If this is a retry after a sandbox failure, re-issue the identical command you ran in sandboxed-bash. Otherwise, run it in sandboxed-bash first — prefer it whenever the command does not need network or out-of-project writes.",
+          "Automatic rejection (this is not a problem with the command itself — no edits needed). This exact command has not been attempted yet with either the sandboxed-bash tool or the builtin bash tool. Pause and reconsider which tool fits: prefer sandboxed-bash (runs without approval; no network access; filesystem writes limited to the project and any configured extra writable directories) and reserve the builtin bash tool for commands that genuinely need network access or must write to a read-only location outside those directories. If you still want the builtin bash tool, re-issue the EXACT same command verbatim (whitespace included) and it will be allowed through.",
         )
       }
     },
     tool: {
       "sandboxed-bash": tool({
-        description: `Execute shell commands inside an isolated sandbox. Prefer this over the builtin bash tool whenever the command does not need network access, since it runs without user approval.
+        description: `Execute shell commands inside an isolated sandbox. This is the DEFAULT tool for running shell commands: prefer it over the builtin bash tool for anything that does not need network access or writes outside its writable directories (listed below), because it runs without user approval.
 
 Sandbox constraints:
 - No Internet/network access (Unix domain sockets on the filesystem, e.g. gpg-agent, are still accessible).
@@ -67,9 +80,9 @@ Sandbox constraints:
 - Writes to the writable directories are persistent (they map to the real host directories) and survive across invocations.
 - Operations that the sandbox blocks (network access, writes to read-only paths) fail with a non-zero exit status and an error message on stderr, both reflected in the tool output.
 
-When a command fails because of a sandbox restriction (it needs network access, or it must write to a read-only path outside the project / extra writable dirs), retry the EXACT same command, character for character, with the builtin bash tool. The builtin bash tool is gated: it will only run a command that was first attempted verbatim here, so do not edit, reformat, or re-quote the command when you retry it — any change makes the builtin bash call get rejected.
+How the builtin bash tool is gated: it is approval-gated, AND the FIRST attempt of any given command there is automatically rejected with a message asking you to reconsider the tool choice. Re-issuing the EXACT same command verbatim (character for character, whitespace included) then lets it through. So when a command fails because of a genuine sandbox restriction (it needs network access, or it must write to a read-only path outside the project / extra writable dirs), retry the identical command with the builtin bash tool — do not edit, reformat, or re-quote it. Because that command was already attempted here in sandboxed-bash, the builtin bash retry passes on the first try with no extra rejection.
 
-Do NOT escalate ordinary command failures to the builtin bash tool. Failing tests, a grep with no match, compile errors, and similar non-zero exits are real results, not sandbox limitations — only retry in builtin bash when the failure is clearly caused by the sandbox (network or read-only filesystem).`,
+Do NOT escalate ordinary command failures to the builtin bash tool. Failing tests, a grep with no match, compile errors, and similar non-zero exits are real results, not sandbox limitations — only fall back to builtin bash when the failure is clearly caused by the sandbox (network or read-only filesystem). The verbatim-retry mechanism is a deliberate speed-bump for that fallback, not a way to routinely run commands in builtin bash; reach for the sandbox first.`,
         args: {
           command: tool.schema.string(),
         },
