@@ -53,7 +53,7 @@ const plugin: Plugin = async (input, options) => {
 
       if (!triedInSandbox) {
         throw new Error(
-          "Run this exact command with the sandboxed-bash tool first. The builtin bash tool requires user approval, so it may only be used after the sandbox has been tried and shown unable to run the command (e.g. it needs network access).",
+          "The builtin bash tool is approval-gated and may only run a command that was first attempted verbatim with the sandboxed-bash tool and shown unable to run there (e.g. it needs network access). The command strings must match exactly, whitespace included. If this is a retry after a sandbox failure, re-issue the identical command you ran in sandboxed-bash. Otherwise, run it in sandboxed-bash first — prefer it whenever the command does not need network or out-of-project writes.",
         )
       }
     },
@@ -67,7 +67,9 @@ Sandbox constraints:
 - Writes to the writable directories are persistent (they map to the real host directories) and survive across invocations.
 - Operations that the sandbox blocks (network access, writes to read-only paths) fail with a non-zero exit status and an error message on stderr, both reflected in the tool output.
 
-Use the builtin bash tool instead when the command needs to download files, reach a remote API, or write a file that must persist outside the project directory.`,
+When a command fails because of a sandbox restriction (it needs network access, or it must write to a read-only path outside the project / extra writable dirs), retry the EXACT same command, character for character, with the builtin bash tool. The builtin bash tool is gated: it will only run a command that was first attempted verbatim here, so do not edit, reformat, or re-quote the command when you retry it — any change makes the builtin bash call get rejected.
+
+Do NOT escalate ordinary command failures to the builtin bash tool. Failing tests, a grep with no match, compile errors, and similar non-zero exits are real results, not sandbox limitations — only retry in builtin bash when the failure is clearly caused by the sandbox (network or read-only filesystem).`,
         args: {
           command: tool.schema.string(),
         },

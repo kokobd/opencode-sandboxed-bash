@@ -1,6 +1,6 @@
 {
   "name": "@kokobd/opencode-sandboxed-bash",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Sandboxed bash plugin for opencode",
   "license": "MIT",
   "type": "module",
