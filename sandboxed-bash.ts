@@ -66,23 +66,23 @@ const plugin: Plugin = async (input, options) => {
 
       if (!triedBefore) {
         throw new Error(
-          "Automatic rejection (this is not a problem with the command itself — no edits needed). This exact command has not been attempted yet with either the sandboxed-bash tool or the builtin bash tool. Pause and reconsider which tool fits: prefer sandboxed-bash (runs without approval; no network access; filesystem writes limited to the project and any configured extra writable directories) and reserve the builtin bash tool for commands that genuinely need network access or must write to a read-only location outside those directories. If you still want the builtin bash tool, re-issue the EXACT same command verbatim (whitespace included) and it will be allowed through.",
+          "Automatic rejection — nothing is wrong with the command itself, no edits needed. This exact command has not been attempted yet with either the sandboxed-bash tool or the builtin bash tool. Pause and reconsider which tool fits: prefer sandboxed-bash (runs without approval; reads the whole filesystem; but has no network access and can only write to the project directory and any configured extra writable directories), and reserve the builtin bash tool for commands that genuinely need network access or must write outside those directories. If you still want the builtin bash tool, re-issue the EXACT same command verbatim (whitespace included) and it will be allowed through.",
         )
       }
     },
     tool: {
       "sandboxed-bash": tool({
-        description: `Execute shell commands inside an isolated sandbox. This is the DEFAULT tool for running shell commands: prefer it over the builtin bash tool for anything that does not need network access or writes outside its writable directories (listed below), because it runs without user approval.
+        description: `Execute shell commands inside an isolated sandbox. This is the DEFAULT tool for running shell commands: prefer it over the builtin bash tool whenever a command needs neither network access nor writes outside the writable directories listed below, because it runs WITHOUT user approval.
 
-Sandbox constraints:
-- No Internet/network access (Unix domain sockets on the filesystem, e.g. gpg-agent, are still accessible).
-- Filesystem is read-only except for the project directory${extraWritableDirs.length > 0 ? ` and these extra writable directories: ${extraWritableDirs.join(", ")}` : ""}.
-- Writes to the writable directories are persistent (they map to the real host directories) and survive across invocations.
-- Operations that the sandbox blocks (network access, writes to read-only paths) fail with a non-zero exit status and an error message on stderr, both reflected in the tool output.
+Sandbox environment:
+- Reads: the entire filesystem is readable, subject to normal user permissions — paths the current user cannot access (e.g. other users' home directories) stay off-limits.
+- Writes: the filesystem is read-only EXCEPT the project directory${extraWritableDirs.length > 0 ? ` and these extra writable directories: ${extraWritableDirs.join(", ")}` : ""}. Writes there are persistent — they map to the real host directories and survive across invocations.
+- Network: no Internet/network access (local Unix domain sockets on the filesystem, e.g. gpg-agent, still work).
+- Blocked operations (network access, writes to read-only paths) fail with a non-zero exit status and an error message on stderr, both reflected in the tool output.
 
-How the builtin bash tool is gated: it is approval-gated, AND the FIRST attempt of any given command there is automatically rejected with a message asking you to reconsider the tool choice. Re-issuing the EXACT same command verbatim (character for character, whitespace included) then lets it through. So when a command fails because of a genuine sandbox restriction (it needs network access, or it must write to a read-only path outside the project / extra writable dirs), retry the identical command with the builtin bash tool — do not edit, reformat, or re-quote it. Because that command was already attempted here in sandboxed-bash, the builtin bash retry passes on the first try with no extra rejection.
+When to fall back to the builtin bash tool: only when a command genuinely needs network access or must write outside the writable directories. The builtin bash tool is approval-gated, AND its FIRST attempt of any given command is automatically rejected to make you reconsider the tool choice. To get through, re-issue the EXACT same command verbatim (character for character, whitespace included) — do not edit, reformat, or re-quote it. Because the command was already attempted here in sandboxed-bash, the verbatim builtin-bash retry passes on the first try with no extra rejection.
 
-Do NOT escalate ordinary command failures to the builtin bash tool. Failing tests, a grep with no match, compile errors, and similar non-zero exits are real results, not sandbox limitations — only fall back to builtin bash when the failure is clearly caused by the sandbox (network or read-only filesystem). The verbatim-retry mechanism is a deliberate speed-bump for that fallback, not a way to routinely run commands in builtin bash; reach for the sandbox first.`,
+Do NOT escalate ordinary command failures to the builtin bash tool. Failing tests, a grep with no match, compile errors, and similar non-zero exits are real results, not sandbox limitations — fall back only when the failure is clearly caused by the sandbox (network or read-only filesystem). The verbatim-retry mechanism is a deliberate speed-bump for that fallback, not a way to routinely run commands in builtin bash; reach for the sandbox first.`,
         args: {
           command: tool.schema.string(),
         },
