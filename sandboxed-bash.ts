@@ -1,13 +1,45 @@
 import {existsSync} from "fs"
 import {tool, type Plugin, type ToolContext, type ToolResult} from "@opencode-ai/plugin"
 
-interface SandboxedBashArgs {
+// This plugin provides two shell tools that together replace the builtin bash tool:
+//
+//   - sandboxed-bash  — runs in a bwrap sandbox, WITHOUT user approval. No network,
+//                        and writes are confined to the project directory (plus any
+//                        configured extra writable directories). This is the default.
+//   - privileged-bash — runs on the host with full authority (network + full
+//                        filesystem). Gated by opencode's native permission prompt.
+//
+// To adopt this plan, disable the builtin bash tool in your opencode config so the
+// model only sees these two:
+//
+//   {
+//     "tools": { "bash": false },
+//     "permission": { "privileged-bash": "ask" }
+//   }
+//
+// `tools: { "bash": false }` adds a `bash` deny rule, which removes the builtin bash
+// tool from the model's tool list. privileged-bash deliberately uses its OWN permission
+// action ("privileged-bash") so that the bash deny rule does not also deny it.
+
+interface BashArgs {
   command: string;
 }
 
 // Bound the output handed back to the model so a runaway command can't blow up the context.
 // 64 KiB per stream is ~16k tokens, large enough for real output but far below the context window.
 const MAX_CAPTURE_BYTES = 64 * 1024
+
+// The permission action used to gate privileged-bash. Kept distinct from "bash" on
+// purpose: disabling the builtin bash tool installs a `bash` deny rule (pattern "*"),
+// and reusing that action here would make every privileged-bash call auto-denied.
+const PRIVILEGED_PERMISSION = "privileged-bash"
+
+// Shown when the builtin bash tool is invoked despite this plan. Disabling it via config
+// (`tools: { "bash": false }`) removes it from the model's tool list entirely; this message
+// is the belt-and-suspenders fallback for setups where that config wasn't applied, so the
+// model is redirected to the two replacement tools rather than silently using host bash.
+const BUILTIN_BASH_DENIED_MESSAGE =
+  `The builtin bash tool is disabled in this project. Use 'sandboxed-bash' for shell commands by default — it runs WITHOUT approval, reads the whole filesystem, but has no network access and can only write to the project directory (plus any configured extra writable directories). Use 'privileged-bash' ONLY when the command genuinely needs network access or must write outside those directories (it runs on the host and is approval-gated). Re-issue your command with one of those two tools.`
 
 const captureNotice = (stdoutTruncated: boolean, stderrTruncated: boolean): string | undefined => {
   const limit = `${MAX_CAPTURE_BYTES / 1024} KiB`
@@ -17,62 +49,47 @@ const captureNotice = (stdoutTruncated: boolean, stderrTruncated: boolean): stri
   return undefined
 }
 
-// How many of the most recent messages we scan for a prior attempt of the same
-// command (in either sandboxed-bash or builtin bash). A window rather than just
-// the last message is deliberate: the model may try the command in the sandbox,
-// do a few unrelated explorations, then fall back to builtin bash — and that
-// fallback should pass without re-triggering the speed-bump.
-const SANDBOX_LOOKBACK_MESSAGES = 10
+interface ShellResult {
+  exitCode: number
+  stdout: Buffer
+  stderr: Buffer
+}
+
+// Turn a finished shell result into the bounded, model-facing output string. Shared by
+// both tools so their output format stays identical.
+const formatOutput = (result: ShellResult): string => {
+  const stdoutTruncated = result.stdout.byteLength > MAX_CAPTURE_BYTES
+  const stderrTruncated = result.stderr.byteLength > MAX_CAPTURE_BYTES
+  const stdout = (stdoutTruncated ? result.stdout.subarray(0, MAX_CAPTURE_BYTES) : result.stdout).toString()
+  const stderr = (stderrTruncated ? result.stderr.subarray(0, MAX_CAPTURE_BYTES) : result.stderr).toString()
+
+  const compact = stdout && stderr
+    ? `${stdout}\n\nstderr:\n${stderr}`
+    : stderr
+      ? `stderr:\n${stderr}`
+      : stdout || "(no output)"
+
+  const notice = captureNotice(stdoutTruncated, stderrTruncated)
+  const body = notice ? `${compact}\n\n${notice}` : compact
+
+  return `${body}\n\nCommand exited with code ${result.exitCode}.`
+}
 
 const plugin: Plugin = async (input, options) => {
   const bwrapPath = (options?.bwrapPath as string) ?? "bwrap"
   const extraWritableDirs = (options?.extraWritableDirs as string[]) ?? []
 
   return {
-    // Speed-bump the builtin bash tool: before it runs (and before the user is
-    // asked to approve it), allow the command only if the exact same command was
-    // already attempted in the recent chat history — in either sandboxed-bash or
-    // builtin bash. The first attempt of any new command is auto-rejected to make
-    // the model pause and reconsider whether the sandbox would do; a verbatim
-    // retry then passes (the rejected attempt is now "already tried in bash").
-    // This nudges toward sandboxed-bash without hard-blocking legitimate fallback
-    // to the approval-gated builtin bash (e.g. when the command needs network).
-    "tool.execute.before": async (hookInput, hookOutput) => {
+    // Hard-deny the builtin bash tool with an agent-friendly redirect. This is a fallback
+    // for when the builtin bash tool has NOT been removed via config (`tools: { "bash": false }`);
+    // when that config is present the tool never reaches the model and this hook never fires.
+    "tool.execute.before": async (hookInput) => {
       if (hookInput.tool !== "bash") return
-
-      const command = hookOutput.args?.command
-      if (typeof command !== "string") return
-      const target = command.trim()
-
-      const response = await input.client.session.messages({
-        path: {id: hookInput.sessionID},
-      })
-      const messages = response.data ?? []
-      const recent = messages.slice(-SANDBOX_LOOKBACK_MESSAGES)
-
-      const triedBefore = recent.some(message =>
-        message.parts.some(part => {
-          if (part.type !== "tool") return false
-          if (part.tool !== "sandboxed-bash" && part.tool !== "bash") return false
-          // Exclude the in-flight call itself: its part already exists in the
-          // session (created when the model emitted the tool call, before this
-          // hook runs), so without this guard the command would always
-          // self-match and the gate would never fire.
-          if (part.callID === hookInput.callID) return false
-          const tried = part.state.input?.command
-          return typeof tried === "string" && tried.trim() === target
-        }),
-      )
-
-      if (!triedBefore) {
-        throw new Error(
-          "Automatic rejection — nothing is wrong with the command itself, no edits needed. This exact command has not been attempted yet with either the sandboxed-bash tool or the builtin bash tool. Pause and reconsider which tool fits: prefer sandboxed-bash (runs without approval; reads the whole filesystem; but has no network access and can only write to the project directory and any configured extra writable directories), and reserve the builtin bash tool for commands that genuinely need network access or must write outside those directories. If you still want the builtin bash tool, re-issue the EXACT same command verbatim (whitespace included) and it will be allowed through.",
-        )
-      }
+      throw new Error(BUILTIN_BASH_DENIED_MESSAGE)
     },
     tool: {
       "sandboxed-bash": tool({
-        description: `Execute shell commands inside an isolated sandbox. This is the DEFAULT tool for running shell commands: prefer it over the builtin bash tool whenever a command needs neither network access nor writes outside the writable directories listed below, because it runs WITHOUT user approval.
+        description: `Execute shell commands inside an isolated sandbox. This is the DEFAULT tool for running shell commands: prefer it over privileged-bash whenever a command needs neither network access nor writes outside the writable directories listed below, because it runs WITHOUT user approval.
 
 Sandbox environment:
 - Reads: the entire filesystem is readable, subject to normal user permissions — paths the current user cannot access (e.g. other users' home directories) stay off-limits.
@@ -80,13 +97,13 @@ Sandbox environment:
 - Network: no Internet/network access (local Unix domain sockets on the filesystem, e.g. gpg-agent, still work).
 - Blocked operations (network access, writes to read-only paths) fail with a non-zero exit status and an error message on stderr, both reflected in the tool output.
 
-When to fall back to the builtin bash tool: only when a command genuinely needs network access or must write outside the writable directories. The builtin bash tool is approval-gated, AND its FIRST attempt of any given command is automatically rejected to make you reconsider the tool choice. To get through, re-issue the EXACT same command verbatim (character for character, whitespace included) — do not edit, reformat, or re-quote it. Because the command was already attempted here in sandboxed-bash, the verbatim builtin-bash retry passes on the first try with no extra rejection.
+When to use privileged-bash instead: ONLY when a command genuinely needs network access or must write outside the writable directories above. privileged-bash runs on the host with full authority and is approval-gated, so reach for the sandbox first.
 
-Do NOT escalate ordinary command failures to the builtin bash tool. Failing tests, a grep with no match, compile errors, and similar non-zero exits are real results, not sandbox limitations — fall back only when the failure is clearly caused by the sandbox (network or read-only filesystem). The verbatim-retry mechanism is a deliberate speed-bump for that fallback, not a way to routinely run commands in builtin bash; reach for the sandbox first.`,
+Do NOT escalate ordinary command failures to privileged-bash. Failing tests, a grep with no match, compile errors, and similar non-zero exits are real results, not sandbox limitations — switch tools only when the failure is clearly caused by the sandbox (network or read-only filesystem).`,
         args: {
           command: tool.schema.string(),
         },
-        async execute(args: SandboxedBashArgs, context: ToolContext): Promise<ToolResult> {
+        async execute(args: BashArgs, context: ToolContext): Promise<ToolResult> {
           const writableDirs: string[] = [context.directory, ...extraWritableDirs.filter(existsSync)]
           const bindArgs: string[] = writableDirs.flatMap(dir => ["--bind", dir, dir])
 
@@ -104,24 +121,38 @@ Do NOT escalate ordinary command failures to the builtin bash tool. Failing test
 
           const result = await input.$`${bwrapPath} ${bwrapArgs}`.nothrow().quiet()
 
-          const exitCode = result.exitCode
+          return {
+            output: formatOutput(result),
+          }
+        },
+      }),
+      "privileged-bash": tool({
+        description: `Execute a shell command on the HOST with full authority: network access and read/write to the entire filesystem (subject to normal user permissions). Each invocation is gated by a user-approval prompt (unless the user has allow-listed the command).
 
-          const stdoutTruncated = result.stdout.byteLength > MAX_CAPTURE_BYTES
-          const stderrTruncated = result.stderr.byteLength > MAX_CAPTURE_BYTES
-          const stdout = (stdoutTruncated ? result.stdout.subarray(0, MAX_CAPTURE_BYTES) : result.stdout).toString()
-          const stderr = (stderrTruncated ? result.stderr.subarray(0, MAX_CAPTURE_BYTES) : result.stderr).toString()
+Use this ONLY when a command genuinely needs something the sandbox cannot provide:
+- network/Internet access, or
+- writes outside sandboxed-bash's writable directories.
 
-          const compact = stdout && stderr
-            ? `${stdout}\n\nstderr:\n${stderr}`
-            : stderr
-              ? `stderr:\n${stderr}`
-              : stdout || "(no output)"
+For everything else — including ordinary command failures like failing tests, an empty grep, or compile errors — use sandboxed-bash. Those failures are real results, not reasons to escalate. Do not use privileged-bash merely to retry a command that failed in the sandbox for a non-sandbox reason.`,
+        args: {
+          command: tool.schema.string(),
+        },
+        async execute(args: BashArgs, context: ToolContext): Promise<ToolResult> {
+          // Gate on the user's approval via opencode's native permission system.
+          // Resolves without prompting if a matching allow rule already exists (e.g.
+          // the user previously chose "always allow"); rejects (throws) on denial,
+          // which surfaces to the model as a tool error and leaves the command unrun.
+          await context.ask({
+            permission: PRIVILEGED_PERMISSION,
+            patterns: [args.command],
+            always: [args.command],
+            metadata: {command: args.command},
+          })
 
-          const notice = captureNotice(stdoutTruncated, stderrTruncated)
-          const body = notice ? `${compact}\n\n${notice}` : compact
+          const result = await input.$`bash -c ${args.command}`.cwd(context.directory).nothrow().quiet()
 
           return {
-            output: `${body}\n\nCommand exited with code ${exitCode}.`,
+            output: formatOutput(result),
           }
         },
       }),
